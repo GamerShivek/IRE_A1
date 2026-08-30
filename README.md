@@ -1,114 +1,79 @@
-# IRE Assignment 1 — Reproducible Data Pipeline
+# IRE Assignment 1 — News Recommendation Retrieval Pipeline
 
-## Q1: Reproducible Data Pipeline (MIND + EB-NeRD)
-
-One command builds everything from raw files to a ready-to-use feature store.
-
----
+This repository implements a complete end-to-end information retrieval pipeline for news recommendation, evaluating both Lexical (BM25) and Semantic (Dense Embeddings) retrieval strategies on two major datasets: **MIND (Microsoft News)** and **EB-NeRD (Ekstra Bladet)**.
 
 ## Quick Start
 
 ```bash
-# From the project/ directory:
-python build_pipeline.py          # Full pipeline — both datasets
-python build_pipeline.py --mind-only
-python build_pipeline.py --ebnerd-only
-python build_pipeline.py --ebnerd-dataset small   # use ebnerd_small instead of demo
-
-# Or via Make:
+# 1. Build the complete data pipeline (Parses raw data, splits chronologically, builds feature store)
 make data
-make data-mind
-make data-ebnerd
-make test          # anti-leakage checks only (after pipeline has run)
-make clean         # remove interim + processed (keeps raw files)
+# Alternatively: python build_pipeline.py
+
+# 2. Tune and run BM25 Lexical Retrieval
+python tune_bm25.py
+python run_bm25.py --tuned
+
+# 3. Run Semantic Retrieval (Computes/loads embeddings and runs ANN search)
+python run_embeddings.py
+
+# 4. Evaluate all results (Computes Recall, MRR, nDCG, Diversity, Novelty + CI slicing)
+python run_eval.py
 ```
 
----
+## Pipeline Architecture
+
+The project is structured sequentially to answer the assignment questions (Q1 to Q5).
+
+### Q1: Reproducible Data Pipeline (`build_pipeline.py`)
+Reads raw dataset files and converts them into a unified `.parquet` schema.
+* **Temporal Split:** Rigorously splits logs chronologically (Train/Val/Test) without leaking future clicks into user history.
+* **Feature Store:** Outputs ready-to-use `articles_features` and `user_features`.
+* **Anti-Leakage Tests:** Runs assertions (`src/tests/test_no_leakage.py`) to guarantee chronological integrity.
+
+### Q2: Lexical Retrieval (`run_bm25.py`, `tune_bm25.py`)
+Implements keyword-based search.
+* **Tokenization:** Cleans titles/abstracts and removes NLTK stopwords.
+* **Indexing (`bm25s`):** Builds a highly optimized sparse-matrix index. Implements "Pseudo-BM25F" by duplicating title tokens to heavily weight title matches over abstracts.
+* **Querying:** Bounding history to the 20 most recent tokens to maintain score variance.
+
+### Q3: Semantic Retrieval (`run_embeddings.py`)
+Implements meaning-based dense retrieval.
+* **MIND:** Generates text embeddings on the fly using `sentence-transformers` (`all-MiniLM-L6-v2`).
+* **EB-NeRD:** Loads provided pre-computed `google_bert_base_multilingual_cased` (mBERT) or Word2Vec embeddings.
+* **User Vectors:** Applies a Time-Decayed Weighted Average (Early Fusion) to the user's click history, representing recent clicks more heavily than older ones.
+* **Search:** Performs L2-Normalized Brute Force dot-product similarity (Cosine Similarity) to rank candidates.
+
+### Q4: Evaluation Harness (`run_eval.py`)
+A comprehensive offline evaluation suite located in `src/eval/`.
+* **Accuracy Metrics:** Recall@K, AUC, MRR, nDCG@5, nDCG@10.
+* **Beyond-Accuracy:** Measures Intra-list Diversity, Novelty, and Catalog Coverage.
+* **Slicing & CI:** Automatically computes Bootstrap 95% Confidence Intervals and slices performance by "Cold-start vs. Warm" users.
+
+## Codabench Submissions
+
+The repository contains optimized scripts strictly for generating Codabench leaderboard submissions on the massive Test sets. They do not train models; they perform memory-efficient inference.
+
+* `generate_codalab_mind_large.py`: Standard Early-Fusion semantic retrieval for MIND Large.
+* `generate_codalab_mind_large_late_fusion.py`: Semantic retrieval using **Late Fusion** (comparing candidates to every history article individually and averaging top 3 matches).
+* `generate_codalab_mind_large_bm25.py`: Lexical retrieval submission.
+* `generate_codalab_ebnerd.py`: Semantic retrieval for EB-NeRD Testset, aggressively optimized with `float16` casting and chunk-streaming to prevent OOM errors.
+* `generate_codalab_ebnerd_late_fusion.py`: Late Fusion implementation for EB-NeRD mBERT embeddings.
 
 ## Directory Layout
 
-```
+```text
 project/
-├── data/
-│   ├── raw/                      # symlinks / copies of raw downloaded data
-│   ├── interim/
-│   │   ├── mind/                 # unified schema, pre-split
-│   │   └── ebnerd/               # unified schema, pre-split
-│   └── processed/
-│       ├── split_manifest.json   # cutoff dates + row counts (reproducibility)
-│       ├── mind/{train,val,test}/
-│       └── ebnerd/{train,val,test}/
-├── src/
-│   ├── parsers/
-│   │   ├── mind_parser.py
-│   │   └── ebnerd_parser.py
-│   ├── temporal_split.py
-│   ├── feature_store.py
-│   └── tests/
-│       └── test_no_leakage.py
-├── build_pipeline.py             # one-command entry point
-├── Makefile
-└── README.md
+├── data/                      # Raw, interim, and processed parquet files
+├── predictions/               # Generated Codabench .zip submission files
+├── results/                   # Local validation metrics (JSON/Parquet)
+├── src/                       
+│   ├── eval/                  # Evaluation metrics (MRR, nDCG, Recall, etc.)
+│   ├── parsers/               # MIND and EB-NeRD raw-to-unified schema parsers
+│   ├── retrieval/             # BM25, Tokenization, ANN index, User Vectors
+│   └── tests/                 # Anti-leakage assertions
+├── build_pipeline.py          # Orchestrates Q1
+├── run_bm25.py                # Orchestrates Q2
+├── run_embeddings.py          # Orchestrates Q3
+├── run_eval.py                # Orchestrates Q4
+└── generate_codalab_*.py      # Codabench inference scripts (Q5)
 ```
-
-Raw datasets are expected one level up (`../MINDsmall_train/`, `../ebnerd_demo/`, etc.) — exactly where the unzipped files land in the `A1/` directory.
-
----
-
-## Pipeline Steps
-
-### Step 1 — Check raw files
-Fails fast with a clear wget message if any required file is missing. Never auto-downloads.
-
-### Step 2 — Parse raw → interim unified schema
-Both parsers output the **same three tables** regardless of source format:
-
-| Table | Columns |
-|---|---|
-| `articles` | article_id (prefixed), title, abstract, body, category, published_time |
-| `impressions` | impression_id, user_id, impression_time, candidate_article_ids, clicked_article_ids |
-| `click_history` | user_id, article_id, click_time |
-
-All IDs are prefixed (`mind_N123`, `ebnerd_9778745`) to prevent collisions if the datasets are ever joined.
-
-### Step 3 — Temporal split (leakage-free)
-- **Rule:** Sort by `impression_time`, cut by date. Never `shuffle=True`.
-- MIND spans ~6 days → `test_days=1`, `val_days=1`.
-- EB-NeRD demo spans ~14 days → `test_days=2`, `val_days=2`.
-- `split_manifest.json` records all cutoff dates + row counts for reproducibility.
-
-### Step 4 — Feature store
-Per dataset per split:
-- `articles_features.parquet` — article fields + placeholder `embedding` column (populated in Q3)
-- `user_features.parquet` — history list + click_count (warm/cold user flag)
-
-### Step 5 — Anti-leakage tests
-Three assertions (see `src/tests/test_no_leakage.py`):
-1. Temporal monotonicity: `max(train) < min(val) < min(test)`
-2. History boundary: `max(history click_time) < min(impression_time)` for val/test
-3. Per-impression spot-check (EB-NeRD only — MIND has no per-click timestamps)
-
----
-
-## Known Dataset Limitations (Q6 design note)
-
-| Dataset | Gap | Handling |
-|---|---|---|
-| MIND | No per-article `published_time` | Column is null; noted in schema |
-| MIND | No article body text | `body` column is null; not fabricated |
-| MIND | No per-click timestamps in history | `click_time` = impression_time of the impression containing the history. Limitation documented. |
-
-These gaps affect Q3 (no body for BM25 fallback), Q4 (no recency decay for MIND history), and Q6's scale discussion.
-
----
-
-## Reproducibility
-
-Running the pipeline twice produces byte-identical output. The row-count summary printed at the end is diffable:
-
-```
-[mind] train=95070  val=31624  test=30271
-[ebnerd] train=34760  val=7442  test=7878
-```
-
-The `split_manifest.json` records exact cutoff datetimes so any future rerun uses identical boundaries.
